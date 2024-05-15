@@ -34,12 +34,16 @@ public:
                   std::uint32_t _max_message_size,
                   configuration::endpoint_queue_limit_t _queue_limit,
                   const std::shared_ptr<configuration>& _configuration);
+    endpoint_impl(endpoint_impl<Protocol> const&) = delete;
+    endpoint_impl(endpoint_impl<Protocol> const&&) = delete;
+
     virtual ~endpoint_impl();
 
     void enable_magic_cookies();
 
     void add_default_target(service_t, const std::string &, uint16_t);
     void remove_default_target(service_t);
+    void remove_stop_handler(service_t);
 
     virtual std::uint16_t get_local_port() const = 0;
     virtual void set_local_port(uint16_t _port) = 0;

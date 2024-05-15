@@ -5,8 +5,10 @@
 
 #include <vsomeip/constants.hpp>
 
-#include <random>
+#include <chrono>
+#include <iomanip>
 #include <forward_list>
+#include <random>
 #include <thread>
 
 #include <vsomeip/internal/logger.hpp>
@@ -114,11 +116,31 @@ service_discovery_impl::init() {
         initial_delay_max = tmp;
     }
 
-    std::random_device r;
-    std::mt19937 e(r());
-    std::uniform_int_distribution<std::uint32_t> distribution(
-            initial_delay_min, initial_delay_max);
-    initial_delay_ = std::chrono::milliseconds(distribution(e));
+    try {
+        std::random_device r;
+        std::mt19937 e(r());
+        std::uniform_int_distribution<std::uint32_t> distribution(
+                initial_delay_min, initial_delay_max);
+        initial_delay_ = std::chrono::milliseconds(distribution(e));
+    } catch (const std::exception& e) {
+        VSOMEIP_ERROR << "Failed to generate random initial delay: " << e.what();
+
+        // Fallback to the Mersenne Twister engine
+        const auto seed = static_cast<std::mt19937::result_type>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::high_resolution_clock::now().time_since_epoch())
+                .count());
+
+        std::mt19937 mtwister{seed};
+
+        // Interpolate between initial_delay bounds
+        initial_delay_ = std::chrono::milliseconds(
+            initial_delay_min +
+            (static_cast<std::int64_t>(mtwister()) *
+             static_cast<std::int64_t>(initial_delay_max - initial_delay_min) /
+             static_cast<std::int64_t>(std::mt19937::max() -
+                                       std::mt19937::min())));
+    }
 
 
     repetitions_base_delay_ = std::chrono::milliseconds(
@@ -228,6 +250,11 @@ service_discovery_impl::update_request(service_t _service, instance_t _instance)
     }
 }
 
+std::recursive_mutex&
+service_discovery_impl::get_subscribed_mutex() {
+    return subscribed_mutex_;
+}
+
 void
 service_discovery_impl::subscribe(
         service_t _service, instance_t _instance,
@@ -245,7 +272,7 @@ service_discovery_impl::subscribe(
     bool is_selective(_info ? _info->is_selective() : false);
 #endif // VSOMEIP_ENABLE_COMPAT
 
-    std::lock_guard<std::mutex> its_lock(subscribed_mutex_);
+    std::lock_guard<std::recursive_mutex> its_lock(subscribed_mutex_);
     auto found_service = subscribed_.find(_service);
     if (found_service != subscribed_.end()) {
         auto found_instance = found_service->second.find(_instance);
@@ -418,7 +445,7 @@ service_discovery_impl::unsubscribe(service_t _service,
 
     boost::asio::ip::address its_address;
     {
-        std::lock_guard<std::mutex> its_lock(subscribed_mutex_);
+        std::lock_guard<std::recursive_mutex> its_lock(subscribed_mutex_);
         auto found_service = subscribed_.find(_service);
         if (found_service != subscribed_.end()) {
             auto found_instance = found_service->second.find(_instance);
@@ -492,7 +519,7 @@ service_discovery_impl::unsubscribe_all(
     boost::asio::ip::address its_address;
 
     {
-        std::lock_guard<std::mutex> its_lock(subscribed_mutex_);
+        std::lock_guard<std::recursive_mutex> its_lock(subscribed_mutex_);
         auto found_service = subscribed_.find(_service);
         if (found_service != subscribed_.end()) {
             auto found_instance = found_service->second.find(_instance);
@@ -534,7 +561,7 @@ service_discovery_impl::unsubscribe_all_on_suspend() {
             std::vector<std::shared_ptr<message_impl> > > its_stopsubscribes;
 
     {
-        std::lock_guard<std::mutex> its_lock(subscribed_mutex_);
+        std::lock_guard<std::recursive_mutex> its_lock(subscribed_mutex_);
         for (auto its_service : subscribed_) {
             for (auto its_instance : its_service.second) {
                 for (auto &its_eventgroup : its_instance.second) {
@@ -582,7 +609,7 @@ void
 service_discovery_impl::remove_subscriptions(
         service_t _service, instance_t _instance) {
 
-    std::lock_guard<std::mutex> its_lock(subscribed_mutex_);
+    std::lock_guard<std::recursive_mutex> its_lock(subscribed_mutex_);
     auto found_service = subscribed_.find(_service);
     if (found_service != subscribed_.end()) {
         found_service->second.erase(_instance);
@@ -844,7 +871,7 @@ service_discovery_impl::create_eventgroup_entry(
                 << std::setw(4) << _service << "."
                 << std::setw(4) << _instance << "."
                 << std::setw(4) << _eventgroup << "] "
-                << (uint16_t) _reliability_type;
+                << static_cast<uint16_t>(_reliability_type);
         return its_data;
     }
     std::shared_ptr<eventgroupentry_impl> its_entry, its_other;
@@ -1049,7 +1076,7 @@ service_discovery_impl::insert_subscription_ack(
     // Selective
     if (_clients.size() > 1 || (*(_clients.begin())) != 0) {
         auto its_selective_option = std::make_shared<selective_option_impl>();
-        (void)its_selective_option->set_clients(_clients);
+        static_cast<void>(its_selective_option->set_clients(_clients));
 
         its_data.options_.push_back(its_selective_option);
     }
@@ -1097,6 +1124,7 @@ service_discovery_impl::on_message(
 #endif
     std::lock_guard<std::mutex> its_lock(check_ttl_mutex_);
     std::lock_guard<std::mutex> its_session_lock(sessions_received_mutex_);
+    std::lock_guard<std::recursive_mutex> its_subscribed_lock(subscribed_mutex_);
 
     if(is_suspended_) {
         return;
@@ -1110,7 +1138,7 @@ service_discovery_impl::on_message(
         static bool must_start_last_msg_received_timer(true);
         boost::system::error_code ec;
 
-        std::lock_guard<std::mutex> its_lock(last_msg_received_timer_mutex_);
+        std::lock_guard<std::mutex> its_lock_inner(last_msg_received_timer_mutex_);
         if (0 < last_msg_received_timer_.cancel(ec) || must_start_last_msg_received_timer) {
             must_start_last_msg_received_timer = false;
             last_msg_received_timer_.expires_from_now(
@@ -1246,7 +1274,7 @@ service_discovery_impl::on_message(
         }
 
         {
-            std::unique_lock<std::recursive_mutex> its_lock(its_acknowledgement->get_lock());
+            std::unique_lock<std::recursive_mutex> its_lock_inner(its_acknowledgement->get_lock());
             its_acknowledgement->complete();
             // TODO: Check the following logic...
             if (its_acknowledgement->has_subscription()) {
@@ -1517,7 +1545,7 @@ service_discovery_impl::process_offerservice_serviceentry(
                                     << std::setw(4) << _instance << "."
                                     << std::setw(4) << eg << "]"
                                     << " using reliability type:  "
-                                    << std::setw(4) << (uint16_t) offer_type;
+                                    << std::setw(4) << static_cast<uint16_t>(offer_type);
                         its_info->set_reliability(offer_type);
                     }
                 }
@@ -1527,7 +1555,6 @@ service_discovery_impl::process_offerservice_serviceentry(
 
     // No need to resubscribe for unicast offers
     if (_received_via_mcast) {
-        std::lock_guard<std::mutex> its_lock(subscribed_mutex_);
         auto found_service = subscribed_.find(_service);
         if (found_service != subscribed_.end()) {
             auto found_instance = found_service->second.find(_instance);
@@ -1664,7 +1691,7 @@ service_discovery_impl::on_endpoint_connected(
         get_subscription_address(its_dummy, _endpoint, its_address);
 
     {
-        std::lock_guard<std::mutex> its_lock(subscribed_mutex_);
+        std::lock_guard<std::recursive_mutex> its_lock(subscribed_mutex_);
         auto found_service = subscribed_.find(_service);
         if (found_service != subscribed_.end()) {
             auto found_instance = found_service->second.find(_instance);
@@ -1922,7 +1949,7 @@ service_discovery_impl::process_eventgroupentry(
                     << ": SOME/IP length field in SubscribeEventGroup message header: ["
                     << std::dec << _entry->get_owning_message()->get_someip_length()
                     << "] bytes, is shorter than length of deserialized message: ["
-                    << (uint32_t) _entry->get_owning_message()->get_length() << "] bytes. "
+                    << static_cast<uint32_t>(_entry->get_owning_message()->get_length()) << "] bytes. "
                     << its_sender.to_string(ec) << " session: "
                     << std::hex << std::setw(4) << std::setfill('0') << its_session;
             return;
@@ -2213,7 +2240,7 @@ service_discovery_impl::process_eventgroupentry(
                 boost::system::error_code ec;
                 VSOMEIP_WARNING << __func__
                     << ": Unsupported eventgroup option ["
-                    << std::hex << (int)its_option->get_type() << "] "
+                    << std::hex << static_cast<int>(its_option->get_type()) << "] "
                     << its_sender.to_string(ec) << " session: "
                     << std::hex << std::setw(4) << std::setfill('0') << its_session;
                 if (its_ttl > 0) {
@@ -2307,7 +2334,7 @@ service_discovery_impl::handle_eventgroup_subscription(
                 << std::setw(4) << _instance << "."
                 << std::setw(4) << _eventgroup << "]"
                 << " not valid: Event configuration ("
-                << (std::uint32_t)_info->get_reliability()
+                << static_cast<std::uint32_t>(_info->get_reliability())
                 << ") does not match the provided endpoint options: "
                 << _first_address.to_string(ec) << ":" << std::dec << _first_port << " "
                 << _second_address.to_string(ec) << ":" << _second_port;
@@ -2330,14 +2357,14 @@ service_discovery_impl::handle_eventgroup_subscription(
         boost::system::error_code ec;
         // TODO: Add session id
         VSOMEIP_ERROR << __func__
-                << ": Requested major version:[" << (uint32_t) _major
+                << ": Requested major version:[" << static_cast<uint32_t>(_major)
                 << "] in subscription to service: ["
                 << std::hex << std::setfill('0')
                 << std::setw(4) << _service << "."
                 << std::setw(4) << _instance << "."
                 << std::setw(4) << _eventgroup << "]"
                 << " does not match with services major version:["
-                << (uint32_t) _info->get_major() << "] subscriber: "
+                << static_cast<uint32_t>(_info->get_major()) << "] subscriber: "
                 << _first_address.to_string(ec) << ":" << std::dec << _first_port;
         if (_ttl > 0) {
             insert_subscription_ack(_acknowledgement, its_info, 0, nullptr, _clients);
@@ -2472,7 +2499,7 @@ service_discovery_impl::handle_eventgroup_subscription_nack(
         uint8_t _counter, const std::set<client_t> &_clients) {
     (void)_counter;
 
-    std::lock_guard<std::mutex> its_lock(subscribed_mutex_);
+    std::lock_guard<std::recursive_mutex> its_lock(subscribed_mutex_);
     auto found_service = subscribed_.find(_service);
     if (found_service != subscribed_.end()) {
         auto found_instance = found_service->second.find(_instance);
@@ -2508,7 +2535,7 @@ service_discovery_impl::handle_eventgroup_subscription_ack(
     (void)_ttl;
     (void)_counter;
 
-    std::lock_guard<std::mutex> its_lock(subscribed_mutex_);
+    std::lock_guard<std::recursive_mutex> its_lock(subscribed_mutex_);
     auto found_service = subscribed_.find(_service);
     if (found_service != subscribed_.end()) {
         auto found_instance = found_service->second.find(_instance);
@@ -3082,8 +3109,8 @@ service_discovery_impl::move_offers_into_main_phase(
     const auto its_timer = repetition_phase_timers_.find(_timer);
     if (its_timer != repetition_phase_timers_.end()) {
         for (const auto& its_service : its_timer->second) {
-            for (const auto& instance : its_service.second) {
-                instance.second->set_is_in_mainphase(true);
+            for (const auto& its_instance : its_service.second) {
+                its_instance.second->set_is_in_mainphase(true);
             }
         }
         repetition_phase_timers_.erase(_timer);
@@ -3100,7 +3127,7 @@ service_discovery_impl::stop_offer_service(
     bool stop_offer_required(false);
     // Delete from initial phase offers
     {
-        std::lock_guard<std::mutex> its_lock(collected_offers_mutex_);
+        std::lock_guard<std::mutex> its_lock_inner(collected_offers_mutex_);
         if (collected_offers_.size()) {
             auto its_service_it = collected_offers_.find(its_service);
             if (its_service_it != collected_offers_.end()) {
@@ -3122,7 +3149,7 @@ service_discovery_impl::stop_offer_service(
 
     // Delete from repetition phase offers
     {
-        std::lock_guard<std::mutex> its_lock(repetition_phase_timers_mutex_);
+        std::lock_guard<std::mutex> its_lock_inner(repetition_phase_timers_mutex_);
         for (auto rpt = repetition_phase_timers_.begin();
                 rpt != repetition_phase_timers_.end();) {
             auto its_service_it = rpt->second.find(its_service);
@@ -3342,16 +3369,10 @@ service_discovery_impl::check_stop_subscribe_subscribe(
         message_impl::entries_t::const_iterator _iter,
         message_impl::entries_t::const_iterator _end,
         const message_impl::options_t& _options) const {
-    const message_impl::entries_t::const_iterator its_next = std::next(_iter);
-    if ((*_iter)->get_ttl() > 0
-            || (*_iter)->get_type() != entry_type_e::STOP_SUBSCRIBE_EVENTGROUP
-            || its_next == _end
-            || (*its_next)->get_type() != entry_type_e::SUBSCRIBE_EVENTGROUP) {
-        return false;
-    }
 
-    return (*static_cast<eventgroupentry_impl*>(_iter->get())).matches(
-            *(static_cast<eventgroupentry_impl*>(its_next->get())), _options);
+	return (*_iter)->get_ttl() == 0
+		&& (*_iter)->get_type() == entry_type_e::STOP_SUBSCRIBE_EVENTGROUP
+		&& has_opposite(_iter, _end, _options);
 }
 
 bool
@@ -3847,7 +3868,7 @@ reliability_type_e service_discovery_impl::get_eventgroup_reliability(
                         << std::setw(4) << _instance << "."
                         << std::setw(4) << _eventgroup << "]"
                         << " using reliability type:  "
-                        << std::setw(4) << (uint16_t) its_reliability;
+                        << std::setw(4) << static_cast<uint16_t>(its_reliability);
             its_info->set_reliability(its_reliability);
         }
     } else {

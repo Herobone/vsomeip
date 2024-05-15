@@ -1,5 +1,5 @@
 
-// Copyright (C) 2014-2021 Bayerische Motoren Werke Aktiengesellschaft (BMW AG)
+// Copyright (C) 2014-2023 Bayerische Motoren Werke Aktiengesellschaft (BMW AG)
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
@@ -50,12 +50,12 @@ tcp_server_endpoint_impl::tcp_server_endpoint_impl(
         VSOMEIP_ERROR << __func__
             << ": set reuse address option failed (" << ec.message() << ")";
 
-#if defined(__linux__) || defined(ANDROID)
+#if defined(__linux__) || defined(ANDROID) || defined(__QNX__)
     // If specified, bind to device
     std::string its_device(configuration_->get_device());
     if (its_device != "") {
         if (setsockopt(acceptor_.native_handle(),
-                SOL_SOCKET, SO_BINDTODEVICE, its_device.c_str(), (socklen_t)its_device.size()) == -1) {
+                SOL_SOCKET, SO_BINDTODEVICE, its_device.c_str(), static_cast<socklen_t>(its_device.size())) == -1) {
             VSOMEIP_WARNING << "TCP Server: Could not bind to device \"" << its_device << "\"";
         }
     }
@@ -141,7 +141,7 @@ bool tcp_server_endpoint_impl::send_error(
         its_data.queue_size_ += _size;
 
         if (!its_data.is_sending_) { // no writing in progress
-            send_queued(its_target_iterator);
+            (void)send_queued(its_target_iterator);
         }
         ret = true;
     }
@@ -157,6 +157,9 @@ bool tcp_server_endpoint_impl::send_queued(const target_data_iterator_type _it) 
         auto connection_iterator = connections_.find(_it->first);
         if (connection_iterator != connections_.end()) {
             its_connection = connection_iterator->second;
+            if (its_connection) {
+                its_connection->send_queued(_it);
+            }
         } else {
             VSOMEIP_INFO << "Didn't find connection: "
                     << _it->first.address().to_string() << ":" << std::dec
@@ -196,11 +199,10 @@ bool tcp_server_endpoint_impl::send_queued(const target_data_iterator_type _it) 
                 }
             }
 
+            // Drop outstanding messages.
+            _it->second.queue_.clear();
             must_erase = true;
         }
-    }
-    if (its_connection) {
-        its_connection->send_queued(_it);
     }
 
     return (must_erase);
@@ -293,8 +295,8 @@ void tcp_server_endpoint_impl::accept_cbk(const connection::ptr& _connection,
         auto its_ep = std::dynamic_pointer_cast<tcp_server_endpoint_impl>(
                 shared_from_this());
         its_timer->async_wait([its_timer, its_ep]
-                               (const boost::system::error_code& _error) {
-            if (!_error) {
+                               (const boost::system::error_code& _error_inner) {
+            if (!_error_inner) {
                 its_ep->start();
             }
         });
@@ -851,12 +853,12 @@ void tcp_server_endpoint_impl::connection::handle_recv_buffer_exception(
             << std::setfill('0') << std::hex;
 
     for (std::size_t i = 0; i < recv_buffer_size_ && i < 16; i++) {
-        its_message << std::setw(2) << (int) (recv_buffer_[i]) << " ";
+        its_message << std::setw(2) << static_cast<int>(recv_buffer_[i]) << " ";
     }
 
     its_message << " Last 16 Bytes captured: ";
     for (int i = 15; recv_buffer_size_ > 15 && i >= 0; i--) {
-        its_message << std::setw(2) <<  (int) (recv_buffer_[static_cast<size_t>(i)]) << " ";
+        its_message << std::setw(2) <<  static_cast<int>(recv_buffer_[static_cast<size_t>(i)]) << " ";
     }
     VSOMEIP_ERROR << its_message.str();
     recv_buffer_.clear();
@@ -952,7 +954,7 @@ void tcp_server_endpoint_impl::print_status() {
     std::lock_guard<std::mutex> its_lock(mutex_);
     connections_t its_connections;
     {
-        std::lock_guard<std::mutex> its_lock(connections_mutex_);
+        std::lock_guard<std::mutex> its_lock_inner(connections_mutex_);
         its_connections = connections_;
     }
 
@@ -1025,7 +1027,7 @@ void tcp_server_endpoint_impl::connection::wait_until_sent(const boost::system::
         }
     }
     {
-        std::lock_guard<std::mutex> its_lock(its_server->connections_mutex_);
+        std::lock_guard<std::mutex> its_lock_inner(its_server->connections_mutex_);
         stop();
     }
     its_server->remove_connection(this);
